@@ -1,0 +1,21 @@
+# LLM Framework & Core
+langchain
+langchain-community
+langchain-openai
+python-dotenv
+
+# Vector Database
+chromadb
+
+# Speech-to-Text (Whisper)
+openai-whisper
+torch
+
+# Text-to-Speech
+gTTS
+pygame
+
+# Utilities for Audio Recording
+sounddevice
+numpy
+scipy
