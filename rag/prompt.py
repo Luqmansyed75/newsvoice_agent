@@ -1,7 +1,33 @@
 import os
 from huggingface_hub import InferenceClient
 
-def build_prompt_and_summarize(query, context):
+def extract_keywords(query):
+    """
+    Uses the HuggingFace LLM to extract the core search keywords from a natural language query.
+    """
+    hf_token = os.environ.get("HUGGINGFACEHUB_API_TOKEN")
+    if not hf_token or hf_token == "your_hugging_face_token_here":
+        return query # Fallback
+        
+    client = InferenceClient(api_key=hf_token)
+    
+    prompt_text = f"Extract the main 2-3 search keywords from the following question. Output ONLY the keywords separated by spaces. Do not output any conversational text or punctuation.\nQuestion: \"{query}\"\nKeywords:"
+    
+    messages = [{"role": "user", "content": prompt_text}]
+    
+    try:
+        response = client.chat.completions.create(
+            model="Qwen/Qwen2.5-72B-Instruct",
+            messages=messages,
+            max_tokens=15,
+            temperature=0.1
+        )
+        return response.choices[0].message.content.strip().replace('"', '')
+    except Exception as e:
+        print(f"Keyword extraction failed: {e}")
+        return query
+
+def build_prompt_and_summarize(query, context, mode="standard"):
     """
     Combines the user's query and the retrieved context, then sends it to 
     a HuggingFace free-tier model for summarization using the modern InferenceClient.
@@ -14,9 +40,16 @@ def build_prompt_and_summarize(query, context):
     print("Connecting to Hugging Face Inference API...")
     client = InferenceClient(api_key=hf_token)
     
+    # ─── New Feature: Dynamic Prompting based on Mode ───
+    if mode == "story":
+        system_instruction = "You are a master storyteller. Use the provided news context to answer the user's query. Weave the facts into a captivating, dramatic, and entertaining narrative."
+    elif mode == "1min":
+        system_instruction = "You are a fast-paced news anchor. Summarize the top headlines from the provided context. Your output MUST be highly dense, exciting, and exactly between 130 and 150 words maximum so it takes exactly one minute to read aloud."
+    else:
+        system_instruction = "You are a helpful Voice News Assistant. Use the provided news context to answer the user's query. Keep your answer brief and conversational."
+    
     # Create the prompt manually
-    prompt_text = f"""You are a helpful Voice News Assistant. 
-Use the provided news context to answer the user's query. Keep your answer brief and conversational.
+    prompt_text = f"""{system_instruction}
 
 News Context:
 {context}

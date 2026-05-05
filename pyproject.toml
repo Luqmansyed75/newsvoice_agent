@@ -16,6 +16,7 @@ dependencies = [
     "openai-whisper>=20250625",
     "pygame>=2.6.1",
     "python-dotenv>=1.2.2",
+    "requests>=2.33.1",
     "scipy>=1.17.1",
     "sentence-transformers>=5.4.1",
     "sounddevice>=0.5.5",

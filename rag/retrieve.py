@@ -1,7 +1,7 @@
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 
-def retrieve_context(query, persist_directory="chroma_db_200", k=2):
+def retrieve_context(query, persist_directory="chroma_db_300", k=2):
     """
     Query the Vector DB and retrieve relevant news chunks.
     """
