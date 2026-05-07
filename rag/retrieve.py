@@ -1,34 +1,65 @@
+"""
+rag/retrieve.py — Vector-store querying.
+
+Improvement: accepts a pre-built in-memory vectorstore object directly,
+removing the need to re-open a disk-based database.  This pairs with the
+ephemeral ChromaDB created in embed.py.
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
 from langchain_chroma import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 
-def retrieve_context(query, persist_directory="chroma_db_300", k=2):
+from config import settings
+
+
+def retrieve_context(
+    query: str,
+    vectorstore: Chroma = None,
+    k: int = None,
+    embeddings: HuggingFaceEmbeddings = None,
+):
     """
-    Query the Vector DB and retrieve relevant news chunks.
+    Query ChromaDB and return the most relevant news chunks.
+
+    Args:
+        query:        The user's natural-language question.
+        vectorstore:  A pre-built in-memory Chroma vectorstore (from
+                      embed_documents).  This is the primary path used
+                      by main.py.
+        k:            Number of chunks to retrieve.
+        embeddings:   Pre-loaded HuggingFaceEmbeddings instance.  Only
+                      needed for standalone/fallback use when no
+                      vectorstore is provided.
+
+    Returns:
+        (context_str, docs) — concatenated text and the raw Document list.
     """
-    # Re-initialize embeddings to query the DB
-    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-    
-    # Load existing Chroma DB
-    vectorstore = Chroma(
-        persist_directory=persist_directory, 
-        embedding_function=embeddings
-    )
-    
-    docs = vectorstore.similarity_search(query, k=k)
+    k = k or settings.RETRIEVE_K
+
+    if vectorstore is None:
+        # Fallback for standalone use / testing — open from disk
+        print("[retrieve] No vectorstore passed in — falling back to disk.")
+        if embeddings is None:
+            print(f"Initialising embeddings model '{settings.EMBEDDING_MODEL}'...")
+            embeddings = HuggingFaceEmbeddings(model_name=settings.EMBEDDING_MODEL)
+        vectorstore = Chroma(
+            persist_directory=settings.CHROMA_DIR,
+            embedding_function=embeddings,
+        )
+
+    docs    = vectorstore.similarity_search(query, k=k)
     context = "\n".join([doc.page_content for doc in docs])
     return context, docs
 
+
 if __name__ == "__main__":
-    # 2. Observe results by testing retrieval against the different chunk sizes we stored
     query = "Give me today's AI news?"
     print(f"QUERY: '{query}'\n")
-    
-    for size in [50, 100, 200]:
-        print(f"--- Retrieving from DB with chunk size {size} ---")
-        try:
-            context, docs = retrieve_context(query, persist_directory=f"chroma_db_{size}")
-            for i, doc in enumerate(docs):
-                print(f"Result {i+1}: {doc.page_content}")
-            print("\n")
-        except Exception as e:
-            print(f"Error retrieving from chroma_db_{size}: {e}")
+    context, docs = retrieve_context(query)
+    for i, doc in enumerate(docs):
+        print(f"Result {i + 1}: {doc.page_content}\n")

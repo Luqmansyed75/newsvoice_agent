@@ -1,115 +1,150 @@
+"""
+voice/stt.py — Speech-to-Text module
+
+Improvements:
+  - Whisper model is loaded ONCE at module level (singleton) — no cold-start
+    delay on the second question you ask.
+  - Recording uses Voice Activity Detection (VAD): it stops automatically
+    the moment you go silent for SILENCE_DURATION seconds, up to a hard cap
+    of MAX_RECORD_SECONDS.  No more sitting in silence waiting for a timer!
+"""
+
+import sys
+import os
 import numpy as np
 import sounddevice as sd
-import scipy.io.wavfile as wav
-import whisper
-import os
+import warnings
 
-# ─── Step 1: Record audio from the microphone ───
-def record_audio(duration=5, sample_rate=16000):
+# ── Allow running this file directly (python voice/stt.py) ──────────────────
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from config import settings
+
+# ── Whisper Singleton ────────────────────────────────────────────────────────
+# Loaded ONCE when this module is first imported.  Every subsequent call to
+# speech_to_text() reuses the already-loaded model — no repeated disk reads.
+_whisper_model = None
+
+def _get_whisper_model():
+    """Returns the cached Whisper model, loading it on the very first call."""
+    global _whisper_model
+    if _whisper_model is None:
+        import whisper
+        warnings.filterwarnings(
+            "ignore", message="FP16 is not supported on CPU; using FP32 instead"
+        )
+        print(f"[Loading Whisper '{settings.WHISPER_MODEL_SIZE}' model — one-time cost...]")
+        _whisper_model = whisper.load_model(settings.WHISPER_MODEL_SIZE)
+        print("[Whisper model ready!]")
+    return _whisper_model
+
+
+# ── VAD Recording ────────────────────────────────────────────────────────────
+
+def record_until_silence(
+    sample_rate: int = None,
+    silence_threshold: float = None,
+    silence_duration: float = None,
+    max_seconds: int = None,
+) -> tuple[np.ndarray, int]:
     """
-    Records audio from the user's microphone for a given duration.
-    
-    Args:
-        duration: How many seconds to record (default: 5 seconds)
-        sample_rate: Audio quality setting (16000 Hz is what Whisper expects)
-    
+    Records from the microphone and stops automatically once the user has been
+    silent for `silence_duration` seconds (or `max_seconds` has elapsed).
+
+    Algorithm:
+      - Audio is captured in small blocks (0.1 s each).
+      - For each block the RMS amplitude is measured.
+      - If RMS < silence_threshold the block is counted as "silent".
+      - Once the cumulative silence exceeds `silence_duration` AND at least
+        0.5 s of speech was heard, recording stops.
+
     Returns:
-        audio_data: Raw audio as a NumPy array
-        sample_rate: The sample rate used
+        (audio_array, sample_rate) — 1-D float32 array ready for Whisper.
     """
-    print(f"\n[Listening for {duration} seconds... Speak now!]")
-    
-    # Record audio from the default microphone
-    audio_data = sd.rec(
-        int(duration * sample_rate),  # Total number of audio samples to capture
-        samplerate=sample_rate,        # 16kHz = standard for speech recognition
-        channels=1,                    # Mono audio (single channel, not stereo)
-        dtype='float32'                # Data type for the audio samples
+    sr               = sample_rate       or settings.SAMPLE_RATE
+    threshold        = silence_threshold or settings.SILENCE_THRESHOLD
+    silence_secs     = silence_duration  or settings.SILENCE_DURATION
+    max_secs         = max_seconds       or settings.MAX_RECORD_SECONDS
+
+    block_duration   = 0.1                        # seconds per chunk
+    block_size       = int(sr * block_duration)   # samples per chunk
+    silence_blocks   = int(silence_secs / block_duration)
+    max_blocks       = int(max_secs    / block_duration)
+
+    print(
+        f"\n[Mic] Listening — speak now! "
+        f"(stops after {silence_secs}s of silence, max {max_secs}s)]"
     )
-    
-    # Block execution until the recording is complete
-    sd.wait()
-    
+
+    collected_chunks   : list[np.ndarray] = []
+    consecutive_silent : int              = 0
+    total_speech_secs  : float            = 0.0
+
+    with sd.InputStream(samplerate=sr, channels=1, dtype="float32") as stream:
+        for _ in range(max_blocks):
+            block, _ = stream.read(block_size)    # shape: (block_size, 1)
+            chunk    = block.flatten()
+            collected_chunks.append(chunk)
+
+            rms = float(np.sqrt(np.mean(chunk ** 2)))
+
+            if rms < threshold:
+                consecutive_silent += 1
+            else:
+                consecutive_silent  = 0
+                total_speech_secs  += block_duration
+
+            # Only stop on silence if we already captured some real speech
+            if consecutive_silent >= silence_blocks and total_speech_secs >= 0.5:
+                print(f"[Silence detected — stopping after {total_speech_secs:.1f}s of speech]")
+                break
+        else:
+            print(f"[Max recording time ({max_secs}s) reached]")
+
+    audio = np.concatenate(collected_chunks, axis=0)
     print("[Recording complete!]")
-    return audio_data, sample_rate
+    return audio, sr
 
-# ─── Step 2: Save the recorded audio to a temporary WAV file ───
-def save_audio(audio_data, sample_rate, filename="temp_recording.wav"):
-    """
-    Saves the recorded NumPy audio array to a .wav file on disk.
-    Whisper requires a file path as input, so we save it temporarily.
-    """
-    # Flatten to 1D array in case it has extra dimensions
-    audio_flat = audio_data.flatten()
-    
-    # Convert float32 audio (-1.0 to 1.0) to int16 format (-32768 to 32767)
-    # WAV files expect integer samples, not floating point
-    audio_int16 = np.int16(audio_flat * 32767)
-    
-    # Write the audio data to a WAV file
-    wav.write(filename, sample_rate, audio_int16)
-    return filename
 
-# ─── Step 3: Transcribe the audio directly using Whisper ───
-def transcribe_audio(audio_array, model_size="base"):
+# ── Transcription ─────────────────────────────────────────────────────────────
+
+def transcribe_audio(audio_array: np.ndarray) -> str:
     """
-    Uses OpenAI Whisper (running locally) to convert the raw audio array to text.
-    By passing the numpy array directly, we bypass the need to install FFmpeg!
-    
-    Args:
-        audio_array: 1D NumPy array of audio data (float32)
-        model_size: Whisper model size
-    
-    Returns:
-        text: The transcribed text string
+    Transcribes a 1-D float32 NumPy audio array using the cached Whisper model.
+    No FFmpeg required — Whisper accepts raw arrays directly.
     """
-    print(f"[Loading Whisper '{model_size}' model...]")
-    
-    import warnings
-    # Ignore the FP16 warning on CPU
-    warnings.filterwarnings("ignore", message="FP16 is not supported on CPU; using FP32 instead")
-    
-    # Load the Whisper model
-    model = whisper.load_model(model_size)
-    
+    model = _get_whisper_model()
     print("[Transcribing your speech...]")
-    
-    # Run the transcription directly on the raw audio array
     result = model.transcribe(audio_array)
-    
-    # Extract just the text
-    text = result["text"].strip()
-    
+    text   = result["text"].strip()
     print(f'[You said: "{text}"]')
     return text
 
-# ─── Main Function: Full Speech-to-Text Pipeline ───
-def speech_to_text(duration=5, model_size="base"):
-    """
-    Complete STT pipeline:
-    1. Record audio from the microphone
-    2. Transcribe it directly using Whisper
-    3. Return the transcribed text as `query`
-    """
-    # Step 1: Record from microphone
-    audio_data, sample_rate = record_audio(duration=duration)
-    
-    # Step 2: Flatten the audio to a 1D float32 array (which Whisper expects)
-    audio_flat = audio_data.flatten()
-    
-    # Step 3: Transcribe using Whisper (passing array directly skips FFmpeg!)
-    query = transcribe_audio(audio_flat, model_size=model_size)
-    
-    # Step 4: Return the text
-    return query
 
+# ── Public API ────────────────────────────────────────────────────────────────
+
+def speech_to_text(
+    silence_threshold: float = None,
+    silence_duration: float  = None,
+    max_seconds: int         = None,
+) -> str:
+    """
+    Full STT pipeline:
+      1. Record with VAD (stops on silence automatically)
+      2. Transcribe with cached Whisper model
+      3. Return the transcribed text
+    """
+    audio, _ = record_until_silence(
+        silence_threshold=silence_threshold,
+        silence_duration=silence_duration,
+        max_seconds=max_seconds,
+    )
+    return transcribe_audio(audio)
+
+
+# ── Standalone test ──────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    # ─── Test: Run the STT module standalone ───
-    print("=== Speech-to-Text Test ===")
-    print("This will record 5 seconds of audio from your microphone.\n")
-    
-    query = speech_to_text(duration=5, model_size="base")
-    
-    print(f"\n--- Final Result ---")
-    print(f"Transcribed query: {query}")
+    print("=== Speech-to-Text Test (VAD + Singleton Whisper) ===\n")
+    result = speech_to_text()
+    print(f"\n--- Transcribed: ---\n{result}")

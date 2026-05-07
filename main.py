@@ -2,107 +2,135 @@
 main.py — Voice News Summarizer Agent
 
 Complete Flow:
-    1. Record audio from mic (sounddevice)
-    2. Convert speech to text query (Whisper)
-    3. Retrieve relevant news chunks from ChromaDB
-    4. Send query + context to Hugging Face LLM for summarization
-    5. Convert the LLM response to speech (gTTS)
-    6. Play the audio output (pygame)
+    1. Load all AI models ONCE at startup (Whisper via stt module singleton;
+       HuggingFace Embeddings created here and reused throughout).
+    2. Record audio with VAD — stops automatically on silence (no fixed timer).
+    3. Convert speech to text (Whisper — already in memory).
+    4. Extract search keywords via Hugging Face LLM.
+    5. Fetch live news + embed into IN-MEMORY ChromaDB (reuses loaded embeddings).
+    6. Retrieve relevant chunks from in-memory vectorstore.
+    7. Summarize with Hugging Face LLM.
+    8. Speak the answer back (gTTS + pygame).
 """
 
 import os
 import sys
 from dotenv import load_dotenv
 
-# Load environment variables (.env file contains our Hugging Face token)
 load_dotenv()
 
-# Import our custom modules
-from voice.stt import speech_to_text
+# ── Import modules ───────────────────────────────────────────────────────────
+from config import settings
+from voice.stt import speech_to_text, _get_whisper_model   # warm-up import
 from voice.tts import text_to_speech
 from rag.embed import embed_documents
 from rag.retrieve import retrieve_context
 from rag.prompt import build_prompt_and_summarize, extract_keywords
 
+
+def _load_embeddings_model():
+    """Load the HuggingFace embedding model once at startup."""
+    from langchain_huggingface import HuggingFaceEmbeddings
+    print(f"[Loading embedding model '{settings.EMBEDDING_MODEL}' — one-time cost...]")
+    emb = HuggingFaceEmbeddings(model_name=settings.EMBEDDING_MODEL)
+    print("[Embedding model ready!]")
+    return emb
+
+
 def main():
     """
-    Main orchestration function that ties together the entire pipeline:
-    Voice Input -> RAG Retrieval -> LLM Summary -> Voice Output
+    Main orchestration: Voice Input → RAG Retrieval → LLM Summary → Voice Output.
+    All heavy AI models are loaded once at the start, then reused.
     """
-    print("=" * 50)
-    print("  Voice News Summarizer Agent")
-    print("=" * 50)
-    
-    # Check if user ran with the --1min flag
+    print("=" * 55)
+    print("  [Mic]  Voice News Summarizer Agent")
+    print("=" * 55)
+
+    # ─── One-time model loading ───────────────────────────────────────────────
+    # Whisper singleton is initialised the first time _get_whisper_model() is
+    # called.  We trigger it here so the user never waits mid-conversation.
+    print("\n[Starting up — loading AI models (done only once)...]")
+    _get_whisper_model()          # Whisper STT
+    embeddings = _load_embeddings_model()   # HuggingFace sentence-transformer
+    print("[All models ready! Let's go.]\n")
+
+    # ─── Mode detection ───────────────────────────────────────────────────────
     is_1min_mode = "--1min" in sys.argv
-    
-    # Wait to fetch news until we know what the user wants!
-    
-    # ─── New Feature: Modes ───
     mode = "standard"
-    
+
     if is_1min_mode:
-        print("\n--- ⏱️ 1-Minute News Mode Activated ---")
+        print("--- [Timer]  1-Minute News Mode (--1min flag) ---")
         query = "Give me a quick digest of all the top headlines."
-        mode = "1min"
+        mode  = "1min"
     else:
-        print("\nThis agent will:")
-        print("  1. Listen to your voice question")
+        print("This agent will:")
+        print("  1. Listen to your voice question (stops when you go silent)")
         print("  2. Search the live news database")
         print("  3. Summarize the relevant news")
         print("  4. Speak the answer back to you\n")
-        
-        # ─── Step 1: Speech-to-Text (Record + Transcribe) ───
+
+        # ── Step 1: Speech → Text (VAD recording + cached Whisper) ───────────
         print("--- Step 1: Listening to your voice ---")
-        query = speech_to_text(duration=10, model_size="base")
-        
-        # Check if Whisper captured anything meaningful
-        if not query or query.strip() == "":
+        query = speech_to_text()   # stops automatically on silence
+
+        if not query or not query.strip():
             print("Could not understand your speech. Please try again.")
             return
-            
+
         print(f'\nYour question: "{query}"\n')
-        
-        # Dynamic Mode Detection based on Voice
-        query_lower = query.lower()
-        if "story" in query_lower:
-            print("\n--- 📖 Story Mode Activated by Voice ---")
+
+        # ── Dynamic mode detection from voice ─────────────────────────────────
+        q = query.lower()
+        if "story" in q:
+            print("--- [Book] Story Mode Activated ---")
             mode = "story"
-        elif "one minute" in query_lower or "1 minute" in query_lower:
-            print("\n--- ⏱️ 1-Minute News Mode Activated by Voice ---")
+        elif "one minute" in q or "1 minute" in q:
+            print("--- [Timer]  1-Minute Mode Activated ---")
             mode = "1min"
-            
-    # ─── Step 1.2: Extract Keywords for Search ───
+
+    # ─── Step 1.5: Keyword extraction ─────────────────────────────────────────
     search_query = extract_keywords(query)
     print(f"\n[AI] Extracted search keywords: '{search_query}'")
-            
-    # ─── Step 1.5: Fetch Live News & Update Vector Database based on Query ───
-    print(f"\n[Fetching] Hunting the internet for news related to: '{search_query}'...")
+
+    # ─── Step 2: Fetch live news + embed into memory (pass shared embeddings) ─
+    print(f"\n[Fetching] Hunting the internet for news on: '{search_query}'...")
     try:
-        embed_documents(query=search_query, chunk_size=300, persist_directory="chroma_db_300")
-        print("[Fetch Complete]")
+        vectorstore = embed_documents(
+            query=search_query,
+            raw_query=query,                # ← original voice query for date detection
+            embeddings=embeddings,          # ← reuse already-loaded model
+        )
+        print("[Fetch complete — vectorstore is in memory]")
     except Exception as e:
         print(f"\nFailed to fetch live news: {e}")
-        print("Please check your NEWS_API_KEY in the .env file! Exiting...")
+        print("Check your NEWS_API_KEY in the .env file! Exiting...")
         return
-    
-    # ─── Step 2: Retrieve relevant news from ChromaDB ───
-    print("--- Step 2: Searching the live news database ---")
-    context, docs = retrieve_context(query, persist_directory="chroma_db_300")
-    print(f"Found {len(docs)} relevant chunks.\n")
-    
-    # ─── Step 3: Generate summary using Hugging Face LLM ───
-    print(f"--- Step 3: Generating AI summary (Mode: {mode}) ---")
-    response = build_prompt_and_summarize(query, context, mode=mode)
-    print(f"\nAI Response: {response}\n")
-    
-    # ─── Step 4: Text-to-Speech (Speak the response) ───
-    print("--- Step 4: Speaking the response ---")
+
+    # ─── Step 3: Retrieve relevant chunks from in-memory vectorstore ──────────
+    print("--- Step 3: Searching the in-memory news database ---")
+    context, docs = retrieve_context(
+        query,
+        vectorstore=vectorstore,            # ← pass in-memory store directly
+    )
+
+    if not context.strip() or context.strip() == "No news articles found for your specific query.":
+        response = "I'm sorry, I couldn't find any recent news on that topic. Please try a different question."
+        print(f"\n[No relevant articles found, skipping LLM call]\n")
+    else:
+        print(f"Found {len(docs)} relevant chunks.\n")
+
+        # ── Step 4: LLM summarization ─────────────────────────────────────────
+        print(f"--- Step 4: Generating AI summary (mode: {mode}) ---")
+        response = build_prompt_and_summarize(query, context, mode=mode)
+        print(f"\nAI Response: {response}\n")
+
+    # ─── Step 5: Text → Speech ────────────────────────────────────────────────
+    print("--- Step 5: Speaking the response ---")
     text_to_speech(response)
-    
-    print("\n" + "=" * 50)
-    print("  Done! Ask another question by running again.")
-    print("=" * 50)
+
+    print("\n" + "=" * 55)
+    print("  Done! Run again to ask another question.")
+    print("=" * 55)
 
 
 if __name__ == "__main__":

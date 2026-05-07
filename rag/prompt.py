@@ -1,4 +1,5 @@
 import os
+from datetime import datetime
 from huggingface_hub import InferenceClient
 
 def extract_keywords(query):
@@ -40,13 +41,17 @@ def build_prompt_and_summarize(query, context, mode="standard"):
     print("Connecting to Hugging Face Inference API...")
     client = InferenceClient(api_key=hf_token)
     
+    # ─── Dynamic Date Injection ───
+    today_str = datetime.now().strftime("%B %d, %Y")
+    date_context = f"Today's exact date is {today_str}. Use the [Published on: ...] timestamps in the news context to determine when each article was published relative to today."
+
     # ─── New Feature: Dynamic Prompting based on Mode ───
     if mode == "story":
-        system_instruction = "You are a master storyteller. Use the provided news context to answer the user's query. Weave the facts into a captivating, dramatic, and entertaining narrative."
+        system_instruction = f"You are a master storyteller. {date_context} Use the provided news context to answer the user's query. Weave the facts into a captivating, dramatic, and entertaining narrative."
     elif mode == "1min":
-        system_instruction = "You are a fast-paced news anchor. Summarize the top headlines from the provided context. Your output MUST be highly dense, exciting, and exactly between 130 and 150 words maximum so it takes exactly one minute to read aloud."
+        system_instruction = f"You are a fast-paced news anchor. {date_context} Summarize the top headlines from the provided context. Your output MUST be highly dense, exciting, and exactly between 130 and 150 words maximum so it takes exactly one minute to read aloud."
     else:
-        system_instruction = "You are a helpful Voice News Assistant. Use the provided news context to answer the user's query. Keep your answer brief and conversational."
+        system_instruction = f"You are a helpful Voice News Assistant. {date_context} Use the provided news context to answer the user's query. Keep your answer brief and conversational."
     
     # Create the prompt manually
     prompt_text = f"""{system_instruction}
